@@ -38,6 +38,10 @@
 #define OPENSSL_64_BIT
 #elif defined(__riscv) && __SIZEOF_POINTER__ == 8
 #define OPENSSL_64_BIT
+#elif defined(__riscv) && __SIZEOF_POINTER__ == 4
+#define OPENSSL_32_BIT
+#elif defined(__xtensa__)
+#define OPENSSL_32_BIT
 #elif defined(__wasm__)
 #define OPENSSL_32_BIT
 // All of following architectures are only supported when `__BYTE_ORDER__` can be used to detect
