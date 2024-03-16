@@ -12,30 +12,59 @@
 // OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 // CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-use crate::c;
+use super::BlockLen;
+use crate::{cpu, polyfill::slice};
+use cfg_if::cfg_if;
 use core::{
     num::Wrapping,
     ops::{Add, AddAssign, BitAnd, BitOr, BitXor, Not, Shr},
 };
 
-#[cfg(not(any(target_arch = "aarch64", target_arch = "arm", target_arch = "x86_64")))]
-pub(super) extern "C" fn sha256_block_data_order(
-    state: &mut super::State,
-    data: *const u8,
-    num: c::size_t,
+pub(super) type State32 = [Wrapping<u32>; CHAINING_WORDS];
+pub(super) type State64 = [Wrapping<u64>; CHAINING_WORDS];
+
+pub(super) fn block_data_order_32(
+    state: &mut State32,
+    data: &[[u8; SHA256_BLOCK_LEN.into()]],
+    cpu_features: cpu::Features,
 ) {
-    let state = unsafe { &mut state.as32 };
-    *state = block_data_order(*state, data, num)
+    cfg_if! {
+        if #[cfg(any(target_arch = "aarch64", target_arch = "arm", target_arch = "x86_64"))] {
+            if let Some(num) = core::num::NonZeroUsize::new(data.len()) {
+                // Assembly require CPU feature detection tohave been done.
+                let _cpu_features = cpu_features;
+                // SAFETY: `data` is a valid non-empty array of `num` blocks.
+                unsafe {
+                    sha256_block_data_order(state, data.as_ptr(), num)
+                }
+            }
+        } else {
+            let _cpu_features = cpu_features; // Unneeded.
+            *state = block_data_order(*state, data)
+        }
+    }
 }
 
-#[cfg(not(any(target_arch = "aarch64", target_arch = "arm", target_arch = "x86_64")))]
-pub(super) extern "C" fn sha512_block_data_order(
-    state: &mut super::State,
-    data: *const u8,
-    num: c::size_t,
+pub(super) fn block_data_order_64(
+    state: &mut State64,
+    data: &[[u8; SHA512_BLOCK_LEN.into()]],
+    cpu_features: cpu::Features,
 ) {
-    let state = unsafe { &mut state.as64 };
-    *state = block_data_order(*state, data, num)
+    cfg_if! {
+        if #[cfg(any(target_arch = "aarch64", target_arch = "arm", target_arch = "x86_64"))] {
+            if let Some(num) = core::num::NonZeroUsize::new(data.len()) {
+                // Assembly require CPU feature detection tohave been done.
+                let _cpu_features = cpu_features;
+                // SAFETY: `data` is a valid non-empty array of `num` blocks.
+                unsafe {
+                    sha512_block_data_order(state, data.as_ptr(), num)
+                }
+            }
+        } else {
+            let _cpu_features = cpu_features; // Unneeded.
+            *state = block_data_order(*state, data)
+        }
+    }
 }
 
 #[cfg_attr(
@@ -43,15 +72,17 @@ pub(super) extern "C" fn sha512_block_data_order(
     allow(dead_code)
 )]
 #[inline]
-fn block_data_order<S: Sha2>(
+fn block_data_order<S: Sha2, const BLOCK_LEN: usize, const BYTES_LEN: usize>(
     mut H: [S; CHAINING_WORDS],
-    M: *const u8,
-    num: c::size_t,
-) -> [S; CHAINING_WORDS] {
-    let M = M.cast::<[S::InputBytes; 16]>();
-    let M: &[[S::InputBytes; 16]] = unsafe { core::slice::from_raw_parts(M, num) };
-
+    M: &[[u8; BLOCK_LEN]],
+) -> [S; CHAINING_WORDS]
+where
+    for<'a> &'a S::InputBytes: From<&'a [u8; BYTES_LEN]>,
+{
     for M in M {
+        let (M, remainder): (&[[u8; BYTES_LEN]], &[u8]) = slice::as_chunks(M);
+        debug_assert!(remainder.is_empty());
+
         // FIPS 180-4 {6.2.2, 6.4.2} Step 1
         //
         // TODO: Use `let W: [S::ZERO; S::ROUNDS]` instead of allocating
@@ -61,7 +92,8 @@ fn block_data_order<S: Sha2>(
         let W: &[S] = {
             let W = &mut W[..S::K.len()];
             for (W, M) in W.iter_mut().zip(M) {
-                *W = S::from_be_bytes(*M);
+                let bytes: &S::InputBytes = M.into();
+                *W = S::from_be_bytes(*bytes);
             }
             for t in M.len()..S::K.len() {
                 W[t] = sigma_1(W[t - 2]) + W[t - 7] + sigma_0(W[t - 15]) + W[t - 16]
@@ -169,6 +201,8 @@ trait Sha2: Word + BitXor<Output = Self> + Shr<usize, Output = Self> {
 
 const MAX_ROUNDS: usize = 80;
 pub(super) const CHAINING_WORDS: usize = 8;
+pub(super) const SHA256_BLOCK_LEN: BlockLen = BlockLen::_512;
+pub(super) const SHA512_BLOCK_LEN: BlockLen = BlockLen::_1024;
 
 impl Word for Wrapping<u32> {
     const ZERO: Self = Self(0);
@@ -372,14 +406,14 @@ impl Sha2 for Wrapping<u64> {
 
 #[cfg(any(target_arch = "aarch64", target_arch = "arm", target_arch = "x86_64"))]
 prefixed_extern! {
-    pub(super) fn sha256_block_data_order(
-        state: &mut super::State,
-        data: *const u8,
-        num: c::size_t,
+    fn sha256_block_data_order(
+        state: &mut [Wrapping<u32>; CHAINING_WORDS],
+        data: *const [u8; SHA256_BLOCK_LEN.into()],
+        num: crate::c::NonZero_size_t,
     );
-    pub(super) fn sha512_block_data_order(
-        state: &mut super::State,
-        data: *const u8,
-        num: c::size_t,
+    fn sha512_block_data_order(
+        state: &mut [Wrapping<u64>; CHAINING_WORDS],
+        data: *const [u8; SHA512_BLOCK_LEN.into()],
+        num: crate::c::NonZero_size_t,
     );
 }
