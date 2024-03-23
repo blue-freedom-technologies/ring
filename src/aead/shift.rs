@@ -12,13 +12,14 @@
 // OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 // CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-use super::block::{Block, BLOCK_LEN};
+use crate::polyfill::sliceutil::overwrite_at_start;
 
 #[cfg(target_arch = "x86")]
-pub fn shift_full_blocks<F>(in_out: &mut [u8], src: core::ops::RangeFrom<usize>, mut transform: F)
-where
-    F: FnMut(&[u8; BLOCK_LEN]) -> Block,
-{
+pub fn shift_full_blocks<const BLOCK_LEN: usize>(
+    in_out: &mut [u8],
+    src: core::ops::RangeFrom<usize>,
+    mut transform: impl FnMut(&[u8; BLOCK_LEN]) -> [u8; BLOCK_LEN],
+) {
     let in_out_len = in_out[src.clone()].len();
 
     for i in (0..in_out_len).step_by(BLOCK_LEN) {
@@ -28,14 +29,14 @@ where
             transform(input)
         };
         let output = <&mut [u8; BLOCK_LEN]>::try_from(&mut in_out[i..][..BLOCK_LEN]).unwrap();
-        *output = *block.as_ref();
+        *output = block;
     }
 }
 
-pub fn shift_partial<F>((in_prefix_len, in_out): (usize, &mut [u8]), transform: F)
-where
-    F: FnOnce(&[u8]) -> Block,
-{
+pub fn shift_partial<const BLOCK_LEN: usize>(
+    (in_prefix_len, in_out): (usize, &mut [u8]),
+    transform: impl FnOnce(&[u8]) -> [u8; BLOCK_LEN],
+) {
     let (block, in_out_len) = {
         let input = &in_out[in_prefix_len..];
         let in_out_len = input.len();
@@ -45,5 +46,5 @@ where
         debug_assert!(in_out_len < BLOCK_LEN);
         (transform(input), in_out_len)
     };
-    in_out[..in_out_len].copy_from_slice(&block.as_ref()[..in_out_len]);
+    overwrite_at_start(&mut in_out[..in_out_len], &block);
 }

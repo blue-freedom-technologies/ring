@@ -23,24 +23,32 @@ use crate::{error, polyfill};
 #[repr(transparent)]
 pub struct BitLength<T = usize>(T);
 
-pub(crate) trait FromUsizeBytes: Sized {
+pub(crate) trait FromByteLen<T>: Sized {
     /// Constructs a `BitLength` from the given length in bytes.
     ///
     /// Fails if `bytes * 8` is too large for a `T`.
-    fn from_usize_bytes(bytes: usize) -> Result<Self, error::Unspecified>;
+    fn from_byte_len(bytes: T) -> Result<Self, error::Unspecified>;
 }
 
-impl FromUsizeBytes for BitLength<usize> {
+impl FromByteLen<usize> for BitLength<usize> {
     #[inline]
-    fn from_usize_bytes(bytes: usize) -> Result<Self, error::Unspecified> {
+    fn from_byte_len(bytes: usize) -> Result<Self, error::Unspecified> {
         let bits = bytes.checked_mul(8).ok_or(error::Unspecified)?;
         Ok(Self(bits))
     }
 }
 
-impl FromUsizeBytes for BitLength<u64> {
+impl FromByteLen<u64> for BitLength<u64> {
     #[inline]
-    fn from_usize_bytes(bytes: usize) -> Result<Self, error::Unspecified> {
+    fn from_byte_len(bytes: u64) -> Result<Self, error::Unspecified> {
+        let bits = bytes.checked_mul(8).ok_or(error::Unspecified)?;
+        Ok(Self(bits))
+    }
+}
+
+impl FromByteLen<usize> for BitLength<u64> {
+    #[inline]
+    fn from_byte_len(bytes: usize) -> Result<Self, error::Unspecified> {
         let bytes = polyfill::u64_from_usize(bytes);
         let bits = bytes.checked_mul(8).ok_or(error::Unspecified)?;
         Ok(Self(bits))
@@ -48,7 +56,7 @@ impl FromUsizeBytes for BitLength<u64> {
 }
 
 impl<T: Copy> BitLength<T> {
-    /// The number of bits this bit length represents, as a `usize`.
+    /// The number of bits this bit length represents, as the underlying type.
     #[inline]
     pub fn as_bits(self) -> T {
         self.0
@@ -89,5 +97,11 @@ impl BitLength<usize> {
     pub(crate) fn try_sub_1(self) -> Result<Self, error::Unspecified> {
         let sum = self.0.checked_sub(1).ok_or(error::Unspecified)?;
         Ok(Self(sum))
+    }
+}
+
+impl BitLength<u64> {
+    pub fn to_be_bytes(self) -> [u8; 8] {
+        self.0.to_be_bytes()
     }
 }

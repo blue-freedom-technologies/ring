@@ -12,17 +12,17 @@
 // OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 // CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-use super::{
-    aes_gcm,
-    block::{Block, BLOCK_LEN},
-    Aad,
-};
+use super::{aes_gcm, Aad};
+
 use crate::{
-    bits::{BitLength, FromUsizeBytes},
-    cpu, error,
-    polyfill::ArraySplitMap,
+    bits::{BitLength, FromByteLen as _},
+    constant_time, cpu, error,
+    polyfill::{sliceutil::overwrite_at_start, ArrayFlatten as _, ArraySplitMap as _},
 };
 use core::ops::BitXorAssign;
+
+// GCM uses the same block type as AES.
+use super::aes::{Block, BLOCK_LEN, ZERO_BLOCK};
 
 mod gcm_nohw;
 
@@ -33,7 +33,7 @@ pub struct Key {
 
 impl Key {
     pub(super) fn new(h_be: Block, cpu_features: cpu::Features) -> Self {
-        let h: [u64; 2] = h_be.as_ref().array_split_map(u64::from_be_bytes);
+        let h: [u64; 2] = h_be.array_split_map(u64::from_be_bytes);
 
         let mut key = Self {
             h_table: HTable {
@@ -111,17 +111,17 @@ impl Context {
 
         let mut ctx = Self {
             inner: ContextInner {
-                Xi: Xi(Block::zero()),
+                Xi: Xi(ZERO_BLOCK),
                 Htable: key.h_table.clone(),
             },
-            aad_len: BitLength::from_usize_bytes(aad.as_ref().len())?,
-            in_out_len: BitLength::from_usize_bytes(in_out_len)?,
+            aad_len: BitLength::from_byte_len(aad.as_ref().len())?,
+            in_out_len: BitLength::from_byte_len(in_out_len)?,
             cpu_features,
         };
 
         for ad in aad.0.chunks(BLOCK_LEN) {
-            let mut block = Block::zero();
-            block.overwrite_part_at(0, ad);
+            let mut block = ZERO_BLOCK;
+            overwrite_at_start(&mut block, ad);
             ctx.update_block(block);
         }
 
@@ -132,6 +132,7 @@ impl Context {
     pub(super) fn in_out_whole_block_bits(&self) -> BitLength<usize> {
         use crate::polyfill::usize_from_u64;
         const WHOLE_BLOCK_BITS_MASK: usize = !0b111_1111;
+        #[allow(clippy::assertions_on_constants)]
         const _WHOLE_BLOCK_BITS_MASK_CORRECT: () =
             assert!(WHOLE_BLOCK_BITS_MASK == !((BLOCK_LEN * 8) - 1));
         BitLength::from_usize_bits(
@@ -267,9 +268,11 @@ impl Context {
     where
         F: FnOnce(Block, cpu::Features) -> super::Tag,
     {
-        self.update_block(Block::from(
-            [self.aad_len.as_bits(), self.in_out_len.as_bits()].map(u64::to_be_bytes),
-        ));
+        self.update_block(
+            [self.aad_len, self.in_out_len]
+                .map(BitLength::to_be_bytes)
+                .array_flatten(),
+        );
 
         f(self.inner.Xi.0, self.cpu_features)
     }
@@ -313,14 +316,7 @@ pub struct Xi(Block);
 impl BitXorAssign<Block> for Xi {
     #[inline]
     fn bitxor_assign(&mut self, a: Block) {
-        self.0 ^= a;
-    }
-}
-
-impl From<Xi> for Block {
-    #[inline]
-    fn from(Xi(block): Xi) -> Self {
-        block
+        self.0 = constant_time::xor(self.0, a)
     }
 }
 
