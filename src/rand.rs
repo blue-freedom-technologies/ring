@@ -53,10 +53,7 @@ impl<T: RandomlyConstructable> Random<T> {
 #[inline]
 pub fn generate<T: RandomlyConstructable>(
     rng: &dyn SecureRandom,
-) -> Result<Random<T>, error::Unspecified>
-where
-    T: RandomlyConstructable,
-{
+) -> Result<Random<T>, error::Unspecified> {
     let mut r = T::zero();
     rng.fill(r.as_mut_bytes())?;
     Ok(Random(r))
@@ -89,8 +86,8 @@ pub(crate) mod sealed {
 }
 
 /// A type that can be returned by `ring::rand::generate()`.
-pub trait RandomlyConstructable: self::sealed::RandomlyConstructable {}
-impl<T> RandomlyConstructable for T where T: self::sealed::RandomlyConstructable {}
+pub trait RandomlyConstructable: sealed::RandomlyConstructable {}
+impl<T> RandomlyConstructable for T where T: sealed::RandomlyConstructable {}
 
 /// A secure random number generator where the random values come directly
 /// from the operating system.
