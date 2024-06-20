@@ -12,18 +12,25 @@
 // OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
 // CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
+use self::ffi::{Block, BLOCK_LEN, ZERO_BLOCK};
 use super::{aes_gcm, Aad};
-
 use crate::{
     bits::{BitLength, FromByteLen as _},
-    constant_time, cpu, error,
-    polyfill::{sliceutil::overwrite_at_start, ArrayFlatten as _, ArraySplitMap as _},
+    cpu, error,
+    polyfill::{sliceutil::overwrite_at_start, ArraySplitMap as _},
 };
-use core::ops::BitXorAssign;
+use cfg_if::cfg_if;
 
-// GCM uses the same block type as AES.
-use super::aes::{Block, BLOCK_LEN, ZERO_BLOCK};
+cfg_if! {
+    if #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))] {
+        pub(super) use self::ffi::{HTable, Xi};
+    } else {
+        use self::ffi::{HTable, Xi};
+    }
+}
 
+#[macro_use]
+mod ffi;
 mod gcm_nohw;
 
 #[derive(Clone)]
@@ -34,118 +41,21 @@ pub struct Key {
 impl Key {
     pub(super) fn new(h_be: Block, cpu_features: cpu::Features) -> Self {
         let h: [u64; 2] = h_be.array_split_map(u64::from_be_bytes);
-
-        let mut key = Self {
-            h_table: HTable {
-                Htable: [U128 { hi: 0, lo: 0 }; HTABLE_LEN],
-            },
-        };
-        let h_table = &mut key.h_table;
-
-        match detect_implementation(cpu_features) {
+        let h_table = match detect_implementation(cpu_features) {
             #[cfg(target_arch = "x86_64")]
-            Implementation::CLMUL if has_avx_movbe(cpu_features) => {
-                prefixed_extern! {
-                    fn gcm_init_avx(HTable: &mut HTable, h: &[u64; 2]);
-                }
-                unsafe {
-                    gcm_init_avx(h_table, &h);
-                }
-            }
+            Implementation::CLMUL if has_avx_movbe(cpu_features) => unsafe {
+                htable_new!(gcm_init_avx, &h, cou_features)
+            },
 
             #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "x86"))]
-            Implementation::CLMUL => {
-                prefixed_extern! {
-                    fn gcm_init_clmul(Htable: &mut HTable, h: &[u64; 2]);
-                }
-                unsafe {
-                    gcm_init_clmul(h_table, &h);
-                }
-            }
+            Implementation::CLMUL => unsafe { htable_new!(gcm_init_clmul, &h, cpu_features) },
 
             #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
-            Implementation::NEON => {
-                prefixed_extern! {
-                    fn gcm_init_neon(Htable: &mut HTable, h: &[u64; 2]);
-                }
-                unsafe {
-                    gcm_init_neon(h_table, &h);
-                }
-            }
+            Implementation::NEON => unsafe { htable_new!(gcm_init_neon, &h, cpu_features) },
 
-            Implementation::Fallback => {
-                h_table.Htable[0] = gcm_nohw::init(h);
-            }
-        }
-
-        key
-    }
-}
-
-/// SAFETY:
-///  * The function `$name` must meet the contract of the `f` paramweter of
-///    `ghash()`.
-#[cfg(any(
-    target_arch = "aarch64",
-    target_arch = "arm",
-    target_arch = "x86",
-    target_arch = "x86_64"
-))]
-macro_rules! ghash {
-    ( $name:ident, $xi:expr, $h_table:expr, $input:expr, $cpu_features:expr ) => {{
-        prefixed_extern! {
-            fn $name(
-                xi: &mut Xi,
-                Htable: &HTable,
-                inp: *const u8,
-                len: crate::c::NonZero_size_t,
-            );
-        }
-        ghash($name, $xi, $h_table, $input, $cpu_features);
-    }};
-}
-
-/// SAFETY:
-///   * `f` must read `len` bytes from `inp`; it may assume
-///     that `len` is a (non-zero) multiple of `BLOCK_LEN`.
-///   * `f` may inspect CPU features.
-#[cfg(any(
-    target_arch = "aarch64",
-    target_arch = "arm",
-    target_arch = "x86",
-    target_arch = "x86_64"
-))]
-unsafe fn ghash(
-    f: unsafe extern "C" fn(
-        xi: &mut Xi,
-        Htable: &HTable,
-        inp: *const u8,
-        len: crate::c::NonZero_size_t,
-    ),
-    xi: &mut Xi,
-    h_table: &HTable,
-    input: &[[u8; BLOCK_LEN]],
-    cpu_features: cpu::Features,
-) {
-    use crate::polyfill::slice;
-    use core::num::NonZeroUsize;
-
-    let input = slice::flatten(input);
-
-    let input_len = match NonZeroUsize::new(input.len()) {
-        Some(len) => len,
-        None => {
-            return;
-        }
-    };
-
-    let _: cpu::Features = cpu_features;
-    // SAFETY:
-    //  * There are `input_len: NonZeroUsize` bytes available at `input` for
-    //    `f` to read.
-    //  * CPU feature detection has been done.
-    unsafe {
-        f(xi, h_table, input.as_ptr(), input_len);
+            Implementation::Fallback => HTable::new_single_entry(gcm_nohw::init(h)),
+        };
+        Self { h_table }
     }
 }
 
@@ -210,7 +120,7 @@ impl<'key> Context<'key> {
 
     pub fn update_blocks(&mut self, input: &[[u8; BLOCK_LEN]]) {
         let xi = &mut self.Xi;
-        let h_table = &self.h_table;
+        let h_table = self.h_table;
 
         match detect_implementation(self.cpu_features) {
             #[cfg(target_arch = "x86_64")]
@@ -219,7 +129,14 @@ impl<'key> Context<'key> {
                 ghash!(gcm_ghash_avx, xi, h_table, input, self.cpu_features);
             },
 
-            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "x86"))]
+            #[cfg(target_arch = "aarch64")]
+            // If we have CLMUL then we probably have AES, so the integrated
+            // implementation will take care of everything except any final
+            // partial block. Thus, we avoid having an optimized implementation
+            // here.
+            Implementation::CLMUL => self.update_blocks_1x(input),
+
+            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
             // SAFETY: gcm_ghash_clmul satisfies the ghash! contract on these
             // targets.
             Implementation::CLMUL => unsafe {
@@ -234,8 +151,16 @@ impl<'key> Context<'key> {
             },
 
             Implementation::Fallback => {
-                gcm_nohw::ghash(xi, h_table.Htable[0], input);
+                gcm_nohw::ghash(xi, h_table.first_entry(), input);
             }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(never)]
+    fn update_blocks_1x(&mut self, input: &[[u8; BLOCK_LEN]]) {
+        for input in input {
+            self.update_block(*input);
         }
     }
 
@@ -243,31 +168,21 @@ impl<'key> Context<'key> {
         self.Xi.bitxor_assign(a);
 
         let xi = &mut self.Xi;
-        let h_table = &self.h_table;
+        let h_table = self.h_table;
 
         match detect_implementation(self.cpu_features) {
             #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", target_arch = "x86"))]
-            Implementation::CLMUL => {
-                prefixed_extern! {
-                    fn gcm_gmult_clmul(xi: &mut Xi, Htable: &HTable);
-                }
-                unsafe {
-                    gcm_gmult_clmul(xi, h_table);
-                }
-            }
+            Implementation::CLMUL => unsafe {
+                gmult!(gcm_gmult_clmul, xi, h_table, self.cpu_features)
+            },
 
             #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
-            Implementation::NEON => {
-                prefixed_extern! {
-                    fn gcm_gmult_neon(xi: &mut Xi, Htable: &HTable);
-                }
-                unsafe {
-                    gcm_gmult_neon(xi, h_table);
-                }
-            }
+            Implementation::NEON => unsafe {
+                gmult!(gcm_gmult_neon, xi, h_table, self.cpu_features)
+            },
 
             Implementation::Fallback => {
-                gcm_nohw::gmult(xi, h_table.Htable[0]);
+                gcm_nohw::gmult(xi, h_table.first_entry());
             }
         }
     }
@@ -276,13 +191,12 @@ impl<'key> Context<'key> {
     where
         F: FnOnce(Block, cpu::Features) -> super::Tag,
     {
-        self.update_block(
-            [self.aad_len, self.in_out_len]
-                .map(BitLength::to_be_bytes)
-                .array_flatten(),
-        );
-
-        f(self.Xi.0, self.cpu_features)
+        let mut block = [0u8; BLOCK_LEN];
+        let (alen, clen) = block.split_at_mut(BLOCK_LEN / 2);
+        alen.copy_from_slice(&BitLength::<u64>::to_be_bytes(self.aad_len));
+        clen.copy_from_slice(&BitLength::<u64>::to_be_bytes(self.in_out_len));
+        self.update_block(block);
+        f(self.Xi.into_block(), self.cpu_features)
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -299,32 +213,6 @@ impl<'key> Context<'key> {
             detect_implementation(self.cpu_features),
             Implementation::CLMUL
         )
-    }
-}
-
-// The alignment is required by some assembly code.
-#[derive(Clone)]
-#[repr(C, align(16))]
-pub(super) struct HTable {
-    Htable: [U128; HTABLE_LEN],
-}
-
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct U128 {
-    hi: u64,
-    lo: u64,
-}
-
-const HTABLE_LEN: usize = 16;
-
-#[repr(transparent)]
-pub struct Xi(Block);
-
-impl BitXorAssign<Block> for Xi {
-    #[inline]
-    fn bitxor_assign(&mut self, a: Block) {
-        self.0 = constant_time::xor(self.0, a)
     }
 }
 
