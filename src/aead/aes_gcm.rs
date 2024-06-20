@@ -17,7 +17,7 @@ use super::{
     gcm, shift, Aad, Nonce, Tag,
 };
 use crate::{
-    constant_time, cpu, error,
+    cpu, error,
     polyfill::{slice, sliceutil::overwrite_at_start, usize_from_u64_saturated},
 };
 use core::ops::RangeFrom;
@@ -89,7 +89,14 @@ pub(super) fn seal(
                 )
             };
 
-            &mut in_out[processed..]
+            match in_out.get_mut(processed..) {
+                Some(remaining) => remaining,
+                None => {
+                    // This can't happen. If it did, then the assembly already
+                    // caused a buffer overflow.
+                    unreachable!()
+                }
+            }
         }
     };
 
@@ -206,7 +213,14 @@ pub(super) fn open(
                     xi,
                 )
             };
-            &mut in_out[processed..]
+            match in_out.get_mut(processed..) {
+                Some(remaining) => remaining,
+                None => {
+                    // This can't happen. If it did, then the assembly already
+                    // caused a buffer overflow.
+                    unreachable!()
+                }
+            }
         }
     };
 
@@ -297,8 +311,7 @@ pub(super) fn open(
 fn finish(aes_key: &aes::Key, gcm_ctx: gcm::Context, tag_iv: aes::Iv) -> Tag {
     // Finalize the tag and return it.
     gcm_ctx.pre_finish(|pre_tag, cpu_features| {
-        let encrypted_iv = aes_key.encrypt_block(tag_iv.into_block_less_safe(), cpu_features);
-        Tag(constant_time::xor(pre_tag, encrypted_iv))
+        Tag(aes_key.encrypt_iv_xor_block(tag_iv, pre_tag, cpu_features))
     })
 }
 
